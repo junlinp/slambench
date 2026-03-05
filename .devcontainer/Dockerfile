@@ -46,7 +46,7 @@ RUN mkdir -p build && cd build && \
              -DGTSAM_BUILD_UNSTABLE=OFF \
              -DGTSAM_BUILD_UNSTABLE_EXAMPLES=OFF \
              -DGTSAM_WITH_TBB=ON && \
-    make -j"$(nproc)" SFMExample_bal SFMExample_SmartFactor_bal
+    make -j"$(nproc)" SFMExample_bal SFMExample_SmartFactor
 
 # Build MSCKF C solver
 WORKDIR /opt/slambench/msckf_c

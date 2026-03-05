@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 double dot3(const double a[3], const double b[3]);
 void cross3(const double a[3], const double b[3], double out[3]);
 void mat3_mul_vec(const double R[9], const double v[3], double out[3]);
@@ -36,5 +40,9 @@ int qr_solve_givens_rm_row_order(double *A, int m, int n, double *b);
 int qr_solve_givens_rm_col_order(double *A, int m, int n, double *b);
 int qr_solve_givens_cm_row_order(double *A, int m, int n, double *b);
 int qr_solve_givens_cm_col_order(double *A, int m, int n, double *b);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
