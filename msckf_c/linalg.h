@@ -15,6 +15,7 @@ void mat3_identity(double I[9]);
 void mat3_expmap(const double w[3], double R[9]);
 void mat3_transpose(const double A[9], double At[9]);
 void angle_axis_to_rot(const double aa[3], double R[9]);
+void rot_to_angle_axis(const double R[9], double aa[3]);
 
 /* Givens rotation helpers */
 void givens(double a, double b, double *c, double *s);

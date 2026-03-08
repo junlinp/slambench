@@ -146,8 +146,19 @@ parse_shur_total() {
 }
 
 parse_shur_iters() {
-  # shur is a pure loader / setup step; treat as 1 "iteration"
-  echo 1
+  local log="$1"
+  # Count "iter N loss" lines (same format as msckf); last iter index + 1 = iters
+  awk '/^iter [0-9]+ loss/ {k=$2} END {print k+1}' "$log"
+}
+
+parse_shur_initial_cost() {
+  local log="$1"
+  awk '/^iter 0 loss/ {print $4; exit}' "$log"
+}
+
+parse_shur_final_cost() {
+  local log="$1"
+  awk '/^iter [0-9]+ loss/ {v=$4} END {print v}' "$log"
 }
 
 run_one_dataset() {
@@ -276,6 +287,8 @@ run_one_dataset() {
   fi
   shur_t=$(parse_shur_total "$shur_log")
   shur_iters=$(parse_shur_iters "$shur_log")
+  shur_ci=$(parse_shur_initial_cost "$shur_log")
+  shur_cf=$(parse_shur_final_cost "$shur_log")
 
   if [[ -z "$sym_t" || -z "$ceres_t" || -z "$ceres_sparse_t" || -z "$gtsam_bal_t" || -z "$gtsam_smart_t" || -z "$msckf_rr_t" || -z "$msckf_rc_t" || -z "$msckf_cr_t" || -z "$msckf_cc_t" || -z "$shur_t" || -z "$sym_iters" || -z "$ceres_iters" || -z "$ceres_sparse_iters" || -z "$gtsam_bal_iters" || -z "$gtsam_smart_iters" || -z "$msckf_rr_iters" || -z "$msckf_rc_iters" || -z "$msckf_cr_iters" || -z "$msckf_cc_iters" || -z "$shur_iters" || "$sym_iters" -eq 0 || "$ceres_iters" -eq 0 || "$ceres_sparse_iters" -eq 0 || "$gtsam_bal_iters" -eq 0 || "$gtsam_smart_iters" -eq 0 || "$msckf_rr_iters" -eq 0 || "$msckf_rc_iters" -eq 0 || "$msckf_cr_iters" -eq 0 || "$msckf_cc_iters" -eq 0 || "$shur_iters" -eq 0 ]]; then
     echo "[bench] failed to parse totals/iters for dataset '$dataset'"
@@ -330,6 +343,8 @@ msckf_openblas_ci_str = "$msckf_openblas_ci"
 msckf_openblas_cf_str = "$msckf_openblas_cf"
 shur_total = float("$shur_t")
 shur_iters = int("$shur_iters")
+shur_ci_str = "$shur_ci"
+shur_cf_str = "$shur_cf"
 
 dataset_name = os.environ.get("DATASET_NAME", "?")
 arch = os.environ.get("ARCH", "?")
@@ -360,7 +375,7 @@ results = [
     ("msckf_rc", msckf_rc_total, msckf_rc_iters, msckf_rc_ci_str, msckf_rc_cf_str),
     ("msckf_cr", msckf_cr_total, msckf_cr_iters, msckf_cr_ci_str, msckf_cr_cf_str),
     ("msckf_cc", msckf_cc_total, msckf_cc_iters, msckf_cc_ci_str, msckf_cc_cf_str),
-    ("shur_loader", shur_total, shur_iters, "", ""),
+    ("shur_loader", shur_total, shur_iters, shur_ci_str, shur_cf_str),
 ]
 if msckf_openblas_total_str and msckf_openblas_iters_str:
     results.append(("msckf_openblas", float(msckf_openblas_total_str), int(msckf_openblas_iters_str), msckf_openblas_ci_str, msckf_openblas_cf_str))

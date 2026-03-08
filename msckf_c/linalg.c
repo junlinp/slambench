@@ -72,6 +72,53 @@ void angle_axis_to_rot(const double aa[3], double R[9]) {
   R[8] = t * z * z + c;
 }
 
+void rot_to_angle_axis(const double R[9], double aa[3]) {
+  double trace = R[0] + R[4] + R[8];
+  double cos_theta = (trace - 1.0) * 0.5;
+  if (cos_theta >= 1.0) {
+    aa[0] = 0.0;
+    aa[1] = 0.0;
+    aa[2] = 0.0;
+    return;
+  }
+  if (cos_theta <= -1.0) {
+    double x = (R[0] > -1.0) ? sqrt((R[0] + 1.0) * 0.5) : 0.0;
+    double y = (R[4] > -1.0) ? sqrt((R[4] + 1.0) * 0.5) : 0.0;
+    double z = (R[8] > -1.0) ? sqrt((R[8] + 1.0) * 0.5) : 0.0;
+    if (x >= y && x >= z && x > 1e-12) {
+      y = (R[1] + R[3]) / (4.0 * x);
+      z = (R[2] + R[6]) / (4.0 * x);
+    } else if (y >= z && y > 1e-12) {
+      x = (R[1] + R[3]) / (4.0 * y);
+      z = (R[5] + R[7]) / (4.0 * y);
+    } else if (z > 1e-12) {
+      x = (R[2] + R[6]) / (4.0 * z);
+      y = (R[5] + R[7]) / (4.0 * z);
+    } else {
+      aa[0] = 0.0;
+      aa[1] = 0.0;
+      aa[2] = 0.0;
+      return;
+    }
+    double theta = 3.14159265358979323846;
+    aa[0] = theta * x;
+    aa[1] = theta * y;
+    aa[2] = theta * z;
+    return;
+  }
+  double theta = acos(cos_theta);
+  double s = sin(theta);
+  if (s < 1e-12) {
+    aa[0] = 0.0;
+    aa[1] = 0.0;
+    aa[2] = 0.0;
+    return;
+  }
+  aa[0] = theta * (R[5] - R[7]) / (2.0 * s);
+  aa[1] = theta * (R[6] - R[2]) / (2.0 * s);
+  aa[2] = theta * (R[1] - R[3]) / (2.0 * s);
+}
+
 static void skew(const double v[3], double S[9]) {
   S[0] = 0;
   S[1] = -v[2];
