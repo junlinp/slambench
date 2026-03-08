@@ -375,7 +375,7 @@ results = [
     ("msckf_rc", msckf_rc_total, msckf_rc_iters, msckf_rc_ci_str, msckf_rc_cf_str),
     ("msckf_cr", msckf_cr_total, msckf_cr_iters, msckf_cr_ci_str, msckf_cr_cf_str),
     ("msckf_cc", msckf_cc_total, msckf_cc_iters, msckf_cc_ci_str, msckf_cc_cf_str),
-    ("shur_loader", shur_total, shur_iters, shur_ci_str, shur_cf_str),
+    ("shur_solver", shur_total, shur_iters, shur_ci_str, shur_cf_str),
 ]
 if msckf_openblas_total_str and msckf_openblas_iters_str:
     results.append(("msckf_openblas", float(msckf_openblas_total_str), int(msckf_openblas_iters_str), msckf_openblas_ci_str, msckf_openblas_cf_str))

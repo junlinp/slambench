@@ -525,16 +525,17 @@ int main(int argc, char **argv) {
     point_obs[pid].indices[idx] = i;
   }
   for (int iter = 0; iter < max_iters; ++iter) {
+    double t_iter_start = wall_seconds();
+
     /* Step 1: Evaluate loss at current state */
-    fprintf(stderr, "[shur] LINE %d iter=%d\n", __LINE__, iter);
-    double t_res0 = wall_seconds();
+    double t_step1 = wall_seconds();
     double loss_prev = compute_loss(cams, R_all, pts, obs, no, huber_delta);
-    residual_eval_time += wall_seconds() - t_res0;
+    double dt_step1 = wall_seconds() - t_step1;
+    residual_eval_time += dt_step1;
     residual_eval_calls++;
     printf("iter %d loss %.6f\n", iter, loss_prev);
 
     /* Step 2: Allocate reduced system S (state_dim x state_dim), b (state_dim); zeroed */
-    fprintf(stderr, "[shur] LINE %d alloc S,b\n", __LINE__);
     valid_points = 0;
     int *camera_index = (int *)malloc(sizeof(int) * (size_t)nc);
     double *S = (double *)calloc((size_t)state_dim * state_dim, sizeof(double));
@@ -547,26 +548,36 @@ int main(int argc, char **argv) {
       break;
     }
 
-    /* Step 3: For each point with >= 2 observations, eliminate the point using Givens QR (identical
-     * to MSCKF) and accumulate S += Hx_null^T Hx_null as a Gram matrix (always PSD — avoids the
-     * catastrophic cancellation in the explicit formula S = B - A Cp^{-1} A^T). */
+    /* Step 3: Givens point elimination + Gram accumulation into S, b.
+     * Optimization: use a compact Hx of size m × (cnt*9) — only the cnt camera blocks
+     * that observe this point are stored.  After Givens the null rows are dense in these
+     * cnt*9 columns only, so the outer product in 3c costs O((cnt*9)^2) instead of
+     * O(state_dim^2), giving a (state_dim/(cnt*9))^2 ≈ 64x speedup for cnt=2. */
+    double t_step3 = wall_seconds();
+    double dt_3a = 0.0, dt_3b = 0.0, dt_3c = 0.0;
     for (int pid = 0; pid < np; ++pid) {
       int cnt = point_obs[pid].count;
       if (cnt < 2) continue;
       valid_points++;
       int m = 2 * cnt;
-      double *Hf = (double *)calloc((size_t)m * 3, sizeof(double));        /* m x 3 point Jacobian */
-      double *Hx = (double *)calloc((size_t)m * state_dim, sizeof(double)); /* m x state_dim camera Jacobian */
-      double *r  = (double *)calloc((size_t)m, sizeof(double));             /* m x 1 residual */
-      if (!Hf || !Hx || !r) { free(Hf); free(Hx); free(r); break; }
+      int compact_cols = cnt * 9; /* only camera blocks that see this point */
 
-      double t_jac0 = wall_seconds();
+      double *Hf = (double *)calloc((size_t)m * 3, sizeof(double));
+      /* Hx_compact: m rows × compact_cols cols; row 2j+0/2j+1 nonzero in block j*9..(j+1)*9-1 */
+      double *Hx = (double *)calloc((size_t)m * compact_cols, sizeof(double));
+      double *r  = (double *)calloc((size_t)m, sizeof(double));
+      int    *cam_list = (int *)malloc(sizeof(int) * (size_t)cnt); /* global cam index per obs */
+      if (!Hf || !Hx || !r || !cam_list) {
+        free(Hf); free(Hx); free(r); free(cam_list); break;
+      }
 
-      /* Step 3a: Build Hf, Hx, r per observation. */
+      /* Step 3a: Build Hf, Hx_compact, r. Each obs j occupies columns j*9..(j+1)*9-1 in Hx. */
+      double t_3a = wall_seconds();
       for (int j = 0; j < cnt; ++j) {
         const Observation *o = &obs[point_obs[pid].indices[j]];
         const Camera *c = &cams[o->cam];
         const double *R = &R_all[o->cam * 9];
+        cam_list[j] = o->cam;
         double up, vp;
         project(c, R, pts[o->point].p, &up, &vp);
         double du = up - o->u;
@@ -579,21 +590,21 @@ int main(int argc, char **argv) {
           Hf[(2 * j + 0) * 3 + col] = sw * Jf[0 * 3 + col];
           Hf[(2 * j + 1) * 3 + col] = sw * Jf[1 * 3 + col];
         }
-        int off = o->cam * 9;
+        int off = j * 9; /* compact offset */
         for (int col = 0; col < 9; ++col) {
-          Hx[(2 * j + 0) * state_dim + (off + col)] = sw * Jc[0 * 9 + col];
-          Hx[(2 * j + 1) * state_dim + (off + col)] = sw * Jc[1 * 9 + col];
+          Hx[(2 * j + 0) * compact_cols + (off + col)] = sw * Jc[0 * 9 + col];
+          Hx[(2 * j + 1) * compact_cols + (off + col)] = sw * Jc[1 * 9 + col];
         }
         r[2 * j + 0] = -sw * du;
         r[2 * j + 1] = -sw * dv;
       }
-
-      jacobian_eval_time += wall_seconds() - t_jac0;
+      dt_3a += wall_seconds() - t_3a;
+      jacobian_eval_time += wall_seconds() - t_3a;
       jacobian_eval_calls++;
 
-      /* Step 3b: Givens QR to zero out Hf below its diagonal — same as MSCKF.
-       * This is equivalent to projecting onto the left null space of Hf (exact, no inversion). */
-      double t_elim0 = wall_seconds();
+      /* Step 3b: Givens QR on Hf (m×3) and Hx_compact (m×compact_cols) and r (m).
+       * compact_cols << state_dim so each apply_givens_rows call is much cheaper. */
+      double t_3b = wall_seconds();
       for (int col = 0; col < 3; ++col) {
         for (int row = m - 1; row > col; --row) {
           double a = Hf[col * 3 + col];
@@ -601,47 +612,82 @@ int main(int argc, char **argv) {
           double c_g, s_g;
           givens(a, bv, &c_g, &s_g);
           apply_givens_rows(Hf, m, 3, col, row, c_g, s_g);
-          apply_givens_rows(Hx, m, state_dim, col, row, c_g, s_g);
+          apply_givens_rows(Hx, m, compact_cols, col, row, c_g, s_g);
           apply_givens_vec(r, col, row, c_g, s_g);
         }
       }
-      point_elim_time += wall_seconds() - t_elim0;
+      dt_3b += wall_seconds() - t_3b;
+      point_elim_time += wall_seconds() - t_3b;
       point_elim_calls++;
 
-      /* Step 3c: Accumulate S += Hx_null^T Hx_null and b += Hx_null^T r_null from null rows.
-       * Hx_null (rows 3..m-1) is the projection of Hx onto null(Hf^T); S is PSD by construction. */
+      /* Precompute global column index for each compact column (avoids div/mod in inner loop). */
+      int *g_map = (int *)malloc(sizeof(int) * (size_t)compact_cols);
+      if (!g_map) { free(Hf); free(Hx); free(r); free(cam_list); break; }
+      for (int k = 0; k < cnt; ++k) {
+        int base = cam_list[k] * 9;
+        for (int i = 0; i < 9; ++i) g_map[k * 9 + i] = base + i;
+      }
+
+      /* Step 3c: S += Hx_null^T Hx_null, b += Hx_null^T r_null.
+       * Restructured by camera-block pairs to write contiguous 9×9 tiles of S —
+       * this is cache-friendly and auto-vectorizable (the rr loop is the innermost). */
+      double t_3c = wall_seconds();
       int keep_rows = m - 3;
+      const double *null_base = &Hx[3 * compact_cols]; /* first null row */
+
+      /* b update: for each null row, scatter into global b */
       for (int rr = 0; rr < keep_rows; ++rr) {
-        const double *hrow = &Hx[(3 + rr) * state_dim];
+        const double *hrow = null_base + rr * compact_cols;
         double rv = r[3 + rr];
-        for (int ci = 0; ci < state_dim; ++ci) {
-          if (hrow[ci] == 0.0) continue;
-          b[ci] += hrow[ci] * rv;
-          for (int cj = ci; cj < state_dim; ++cj) {
-            double v = hrow[ci] * hrow[cj];
-            S[ci * state_dim + cj] += v;
-            if (ci != cj) S[cj * state_dim + ci] += v;
+        for (int ci = 0; ci < compact_cols; ++ci)
+          b[g_map[ci]] += hrow[ci] * rv;
+      }
+
+      /* S update: iterate over upper-triangle block pairs (k1 ≤ k2).
+       * For each pair write a contiguous 9×9 tile of S. */
+      for (int k1 = 0; k1 < cnt; ++k1) {
+        int g1 = cam_list[k1] * 9;
+        for (int k2 = k1; k2 < cnt; ++k2) {
+          int g2 = cam_list[k2] * 9;
+          /* Accumulate 9×9 outer product tile over all null rows. */
+          for (int i = 0; i < 9; ++i) {
+            double col_i[16]; /* null-row values at compact col k1*9+i, up to 13 null rows */
+            for (int rr = 0; rr < keep_rows; ++rr)
+              col_i[rr] = null_base[rr * compact_cols + k1 * 9 + i];
+            int jstart = (k2 == k1) ? i : 0;
+            for (int j = jstart; j < 9; ++j) {
+              double s = 0.0;
+              for (int rr = 0; rr < keep_rows; ++rr)
+                s += col_i[rr] * null_base[rr * compact_cols + k2 * 9 + j];
+              int gi = (g1 + i) * state_dim + (g2 + j);
+              S[gi] += s;
+              if (k1 != k2 || i != j)
+                S[(g2 + j) * state_dim + (g1 + i)] += s;
+            }
           }
         }
       }
+      dt_3c += wall_seconds() - t_3c;
+      free(g_map);
 
       free(Hf);
       free(Hx);
       free(r);
+      free(cam_list);
     }
 
-    /* Step 4: Regularize S — same per-state damping as MSCKF (anchor + reg lambda).
-     * S is now built as a Gram matrix (always PSD), so no large floor is needed. */
-    fprintf(stderr, "[shur] LINE %d point loop done, regularize\n", __LINE__);
+    double dt_step3 = wall_seconds() - t_step3;
+
+    /* Step 4: Regularize S — same per-state damping as MSCKF (anchor + reg lambda). */
     const double anchor_lambda = 1e-3;
     const double reg_lambda = 1e-6;
     for (int i = 0; i < state_dim; ++i)
       S[i * state_dim + i] += (i < 6) ? anchor_lambda : reg_lambda;
 
-    /* Step 5: Solve S*dx_cam = b via Cholesky. S is PSD by construction; solve should succeed. */
-    fprintf(stderr, "[shur] LINE %d before cholesky_solve\n", __LINE__);
+    /* Step 5: Solve S*dx_cam = b via Cholesky. */
+    double t_step5 = wall_seconds();
     int solve_ok = cholesky_solve(S, b, state_dim);
-    fprintf(stderr, "[shur] LINE %d after cholesky_solve ok=%d\n", __LINE__, solve_ok);
+    double dt_step5 = wall_seconds() - t_step5;
     if (solve_ok != 0) {
       fprintf(stderr, "shur: Cholesky solve failed at iter %d\n", iter);
       free(camera_index);
@@ -651,7 +697,8 @@ int main(int argc, char **argv) {
     }
     /* b now holds dx_cam (same delta as MSCKF bred) */
 
-    /* Step 6: Compute dx_point = Cp_inv * (JpTr - A^T dx_cam) per point (same as MSCKF delta_pts). */
+    /* Step 6: Compute dx_point per point (back-substitution). */
+    double t_step6 = wall_seconds();
     double *dx_points = (double *)calloc((size_t)np * 3, sizeof(double));
     if (!dx_points) {
       free(camera_index);
@@ -726,7 +773,10 @@ int main(int argc, char **argv) {
       free(cam_idx);
     }
 
-    /* Step 7: Backtracking line search (same as MSCKF): apply alpha*dx, accept first alpha that reduces loss. */
+    double dt_step6 = wall_seconds() - t_step6;
+
+    /* Step 7: Backtracking line search. */
+    double t_step7 = wall_seconds();
     Camera *cams_try = (Camera *)malloc(sizeof(Camera) * (size_t)nc);
     Point *pts_try = (Point *)malloc(sizeof(Point) * (size_t)np);
     double *R_try = (double *)malloc(sizeof(double) * 9 * (size_t)nc);
@@ -783,10 +833,13 @@ int main(int argc, char **argv) {
     free(camera_index);
     free(S);
     free(b);
-    fprintf(stderr, "[shur] LINE %d iter done\n", __LINE__);
+
+    double dt_step7 = wall_seconds() - t_step7;
+    double dt_iter  = wall_seconds() - t_iter_start;
+    printf("  iter %d timing (s): loss=%.4f  [3a jacobian=%.4f  3b givens=%.4f  3c gram=%.4f  step3=%.4f]  solve=%.4f  backsolve=%.4f  linesearch=%.4f  total=%.4f\n",
+           iter, dt_step1, dt_3a, dt_3b, dt_3c, dt_step3, dt_step5, dt_step6, dt_step7, dt_iter);
   }
 
-  fprintf(stderr, "[shur] LINE %d after iter loop\n", __LINE__);
   printf("shur: loaded dataset '%s'\n", path);
   printf("  cameras      : %d\n", nc);
   printf("  points       : %d\n", np);
