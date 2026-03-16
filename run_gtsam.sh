@@ -6,7 +6,7 @@ DATASET="${1:-problem-16-22106-pre.txt}"
 DATASET_PATH="$ROOT_DIR/data/dubrovnik/$DATASET"
 LOG_FILE="${2:-$ROOT_DIR/gtsam.log}"
 BINARY_BAL="/opt/slambench/gtsam/build/examples/SFMExample_bal"
-BINARY_SMART="/opt/slambench/gtsam/build/examples/SFMExample_SmartFactor"
+BINARY_SMART="/opt/slambench/gtsam/build/examples/SFMExample_SmartFactor_bal"
 LOG_BASE="${LOG_FILE%.log}"
 if [[ "$LOG_BASE" == "$LOG_FILE" ]]; then
   LOG_BASE="$LOG_FILE"
