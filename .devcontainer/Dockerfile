@@ -1,6 +1,6 @@
-FROM ubuntu:22.04
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
-# Install build essentials, Python 3.10 toolchain, sudo, and deps for symforce/ceres build
+# Install build essentials, Python 3.10 toolchain, and deps for all solvers
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev python3-venv \
@@ -48,16 +48,22 @@ RUN mkdir -p build && cd build && \
              -DGTSAM_WITH_TBB=ON && \
     make -j"$(nproc)" SFMExample_bal SFMExample_SmartFactor_bal
 
-# Build MSCKF C solver
+# Build MSCKF C solvers (CPU + GPU)
 WORKDIR /opt/slambench/msckf_c
 COPY msckf_c/ /opt/slambench/msckf_c/
 RUN mkdir -p build && cd build && \
     cmake .. -DCMAKE_BUILD_TYPE=Release && \
-    make -j"$(nproc)" msckf_runner
+    make -j"$(nproc)" msckf_runner shur_runner
+
+# Build GPU shur solver if nvcc is available
+RUN if command -v nvcc &> /dev/null; then \
+        cd /opt/slambench/msckf_c && \
+        nvcc -O3 -arch=sm_61 -o build/shur_gpu shur_gpu.cu -lm; \
+    fi
 
 # Copy scripts/data into the image workspace
 WORKDIR /workspace
-COPY run_symforce.sh run_ceres.sh run_gtsam.sh run_msckf.sh run_benchmarks.sh README.md ./ 
+COPY run_symforce.sh run_ceres.sh run_gtsam.sh run_msckf.sh run_shur.sh run_benchmarks.sh README.md ./
 COPY data/ ./data/
 RUN chmod +x /workspace/run_*.sh
 
@@ -75,7 +81,7 @@ RUN groupadd --gid $USER_GID $USERNAME && \
     useradd --uid $USER_UID --gid $USER_GID -m $USERNAME && \
     echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME && \
     chmod 0440 /etc/sudoers.d/$USERNAME && \
-    chown -R $USERNAME:$USER_GID /workspace
+    chown -R $USERNAME:$USERNAME /workspace
 
 # Switch to non-root user by default
 USER $USERNAME
