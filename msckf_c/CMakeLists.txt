@@ -46,3 +46,6 @@ if(OPENBLAS_LIB)
   target_link_libraries(msckf_runner_openblas PRIVATE msckf_linalg m ${OPENBLAS_LIB})
   target_compile_definitions(msckf_runner_openblas PRIVATE MSCKF_STORAGE_COL_MAJOR=1 MSCKF_USE_LAPACK=1 MSCKF_USE_OPENBLAS=1)
 endif()
+
+add_executable(msckf_runner_sliding msckf_sliding.c linalg.c)
+target_link_libraries(msckf_runner_sliding PRIVATE m)

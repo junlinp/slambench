@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct { double r[3], t[3], f, k1, k2; } Camera;
 typedef struct { double p[3]; } Point;
@@ -204,8 +205,8 @@ __global__ void accum_point_kernel(
           double va0=Hx_block[col*cc+0], vb0=Hx_block[row*cc+0];
           printf("GPU rot col0 row5: cg=%.8f sg=%.8f Hx[0] before=%.6e after=%.6e\n", cg, sg, va0, cg*va0+sg*vb0);
         }
-        // Rotate Hf (shared)
-        for(int k=col;k<3;k++){
+        // Rotate Hf (shared) — ALL columns, not just col..2
+        for(int k=0;k<3;k++){
           double va=Hf[col*3+k], vb=Hf[row*3+k];
           Hf[col*3+k]=cg*va+sg*vb; Hf[row*3+k]=-sg*va+cg*vb;
         }
@@ -296,7 +297,7 @@ __global__ void backsolve_point_kernel(
         double a=Hf[col*3+col],bv=Hf[row*3+col];
         if(bv==0) continue;
         double h=sqrt(a*a+bv*bv),cg=a/h,sg=bv/h;
-        for(int k=col;k<3;k++){
+        for(int k=0;k<3;k++){
           double va=Hf[col*3+k],vb=Hf[row*3+k];
           Hf[col*3+k]=cg*va+sg*vb; Hf[row*3+k]=-sg*va+cg*vb;
         }

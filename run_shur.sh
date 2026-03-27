@@ -15,22 +15,28 @@ if [[ ! -f "$DATASET_PATH" ]]; then
   exit 1
 fi
 
-# Build shur_runner (CPU) if not present
+# Build shur_runner (CPU) from workspace, or use image binary (/opt/slambench from Dockerfile)
 if [[ -d "$ROOT_DIR/msckf_c" ]]; then
   cmake -S "$ROOT_DIR/msckf_c" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1
   cmake --build "$BUILD_DIR" --config Release -j >/dev/null 2>&1
 fi
 
 WORKSPACE_BINARY="$BUILD_DIR/shur_runner"
-if [[ ! -x "$WORKSPACE_BINARY" ]]; then
-  echo "[shur] CPU binary not found: $WORKSPACE_BINARY"
+IMAGE_BINARY="/opt/slambench/msckf_c/build/shur_runner"
+if [[ -x "$WORKSPACE_BINARY" ]]; then
+  SHUR_BIN="$WORKSPACE_BINARY"
+elif [[ -x "$IMAGE_BINARY" ]]; then
+  SHUR_BIN="$IMAGE_BINARY"
+else
+  echo "[shur] CPU binary not found:"
+  echo "  - $WORKSPACE_BINARY (build from workspace msckf_c)"
+  echo "  - $IMAGE_BINARY (devcontainer image)"
   exit 1
 fi
 
-CMD="$WORKSPACE_BINARY \"$DATASET_PATH\""
-echo "[shur] command: $CMD"
+echo "[shur] command: $SHUR_BIN $DATASET_PATH"
 
 TIMEFORMAT="TIME %R"
-{ time eval "$CMD"; } > "$LOG_FILE" 2>&1
+{ time "$SHUR_BIN" "$DATASET_PATH"; } > "$LOG_FILE" 2>&1
 
 echo "[shur] done. Log: $LOG_FILE"
