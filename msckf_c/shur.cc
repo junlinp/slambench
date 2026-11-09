@@ -12,29 +12,32 @@
 //   S = B - A * Cp^{-1} * A^T,
 //   b_reduced = b_cam - A * Cp^{-1} * b_pt.
 //
-// We accumulate S and b_reduced by looping over points: for each point we form
-// its B block (camera-camera), Cp and A (camera-point), then add B to S and
-// subtract A Cp^{-1} A^T from S, and add the RHS contribution. Then we solve
-// (S + lambda*I)*dx_cam = b_reduced (Cholesky), update cameras, and repeat.
-//
 // DETAILED STEPS (per iteration)
 // -------------------------------
-// 1. Evaluate loss (reprojection cost) at current camera/point state.
-// 2. Allocate reduced system: S (state_dim x state_dim), b (state_dim); zero both.
-// 3. For each point p with >= 2 observations, use Givens QR to eliminate the 3 point columns (same
-//    as MSCKF). This gives null-space rows Hx_null where the point Jacobian is zero. Accumulate:
-//      S += Hx_null^T Hx_null   (always PSD — no catastrophic cancellation)
-//      b += Hx_null^T r_null
-//    Note: the explicit formula S = B - A Cp^{-1} A^T has catastrophic cancellation (B and A Cp^{-1} A^T
-//    are both ~1e8 but their difference is ~1e4), causing S to be numerically indefinite and requiring
-//    large Tikhonov regularization that kills Gauss-Newton convergence.
-// 4. Regularize S: same per-state damping as MSCKF (anchor_lambda=1e-3 on first 6, reg_lambda=1e-6 on rest).
-// 5. Solve S*dx_cam = b via Cholesky (in-place); b becomes dx_cam (same delta as MSCKF bred).
-// 6. Compute dx_point per point using MSCKF point backsolve: re-linearize and QR-solve Hf*dx_pt = r - Hc*dx_cam.
+// 1. Evaluate the reprojection loss at the current state.
+// 2. Zero the reduced camera system S and b.
+// 3. For each point seen in at least two observations, find an orthonormal
+//    basis U for the three point directions. In observation coordinates,
+//    P = I - U U^T projects out the point update. Assemble the camera terms
+//    J_cam^T P J_cam and J_cam^T P (-r) in 2-by-2 observation blocks.
+// 4. Regularize S with the same per-state damping as MSCKF.
+// 5. Solve S * dx_cam = b in place by Cholesky.
+// 6. Reuse the linearization to solve the damped 3-by-3 point systems with
+//    residual -r - J_cam * dx_cam.
 // 7. Backtracking line search (same as MSCKF): apply alpha*dx with R_new = exp(alpha*dtheta)*R; accept first alpha that reduces loss.
 // 8. Repeat from step 1 for max_iters.
 
 #include "linalg.h"
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
 
 #include <math.h>
 #include <stdio.h>
@@ -42,33 +45,7 @@
 #include <string.h>
 #include <time.h>
 
-template<int residual_dim, int camera_dim, int point_dim>
-void shur_construction(double *Hc, double *Hp, double *A) {
-    // A = Hc^T * Hp (camera_dim x point_dim)
-    for (int r = 0; r < camera_dim; ++r) {
-        for (int c = 0; c < point_dim; ++c) {
-            double s = 0.0;
-            for (int k = 0; k < residual_dim; ++k) {
-                s += Hp[k * point_dim + c] * Hc[k * camera_dim + r];
-            }
-            A[r * point_dim + c] = s;
-        }
-    }
-}
-
-/* Cp_block += Hp^T * Hp (Hp is residual_dim x 3, result 3x3). Used to accumulate point Hessian. */
-static void accum_HptHp(const double *Hp, int residual_dim, double *Cp_block) {
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            double s = 0.0;
-            for (int k = 0; k < residual_dim; ++k)
-                s += Hp[k * 3 + r] * Hp[k * 3 + c];
-            Cp_block[r * 3 + c] += s;
-        }
-    }
-}
-
-/* Cholesky factor L of 3x3 SPD A (row-major): A = L L^T, L lower. Returns 0 on success, -1 if not SPD. */
+/* Cholesky factor L of a 3x3 SPD matrix. Reads the lower triangle of A. */
 static int cholesky_3x3_spd(const double *A, double *L) {
   double d = A[0 * 3 + 0];
   if (d <= 0.0) return -1;
@@ -90,28 +67,23 @@ static int cholesky_3x3_spd(const double *A, double *L) {
   return 0;
 }
 
-/* Invert 3x3 SPD A into A_inv (row-major) via Cholesky: A = L L^T, A_inv = L^{-T} L^{-1}. Returns 0 on success, -1 if not SPD. */
-static int inv_3x3(const double *A, double *A_inv) {
+/* Solve the regularized 3-by-3 point normal equations in place. */
+static void solve_point_system(const double *normal, double *rhs) {
   double L[9];
-  if (cholesky_3x3_spd(A, L) != 0) {
-    for (int i = 0; i < 9; ++i) A_inv[i] = 0.0;
-    return -1;
+  if (cholesky_3x3_spd(normal, L) != 0) {
+    std::fill_n(rhs, 3, 0.0);
+    return;
   }
-  /* Solve L Y = I then L^T A_inv = Y (column j of A_inv). */
-  for (int j = 0; j < 3; ++j) {
-    double y[3];
-    for (int i = 0; i < 3; ++i) {
-      double s = (i == j) ? 1.0 : 0.0;
-      for (int k = 0; k < i; ++k) s -= L[i * 3 + k] * y[k];
-      y[i] = s / L[i * 3 + i];
-    }
-    for (int i = 2; i >= 0; --i) {
-      double s = y[i];
-      for (int k = i + 1; k < 3; ++k) s -= L[k * 3 + i] * A_inv[k * 3 + j];
-      A_inv[i * 3 + j] = s / L[i * 3 + i];
-    }
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < i; ++j)
+      rhs[i] -= L[3 * i + j] * rhs[j];
+    rhs[i] /= L[3 * i + i];
   }
-  return 0;
+  for (int i = 2; i >= 0; --i) {
+    for (int j = i + 1; j < 3; ++j)
+      rhs[i] -= L[3 * j + i] * rhs[j];
+    rhs[i] /= L[3 * i + i];
+  }
 }
 
 void outer_product(const double *A, int m, int n, double *C) {
@@ -182,7 +154,7 @@ static void lt_times_vec(const double *L, const double *x, double *z, int n) {
 }
 
 // In-place Cholesky L (lower) in S, then solve L y = b, L^T x = y; x overwrites b.
-// S is n x n symmetric positive definite, row-major. Returns 0 on success.
+// Reads only the lower triangle of the row-major SPD matrix S. Returns 0 on success.
 static int cholesky_solve(double *S, double *b, int n) {
   for (int j = 0; j < n; ++j) {
     double d = S[j * n + j];
@@ -237,20 +209,8 @@ typedef struct {
 
 typedef struct {
   int count;
-  int *indices;
+  Observation *observations;
 } PointObs;
-
-static void skew(const double v[3], double S[9]) {
-  S[0] = 0;
-  S[1] = -v[2];
-  S[2] = v[1];
-  S[3] = v[2];
-  S[4] = 0;
-  S[5] = -v[0];
-  S[6] = -v[1];
-  S[7] = v[0];
-  S[8] = 0;
-}
 
 static double wall_seconds(void) {
   struct timespec ts;
@@ -258,9 +218,212 @@ static double wall_seconds(void) {
   return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
+/* Thin Householder QR of the three point columns. Reflectors are stored
+ * below the diagonal of Jp, then applied to the first three unit vectors. */
+static void householder_point_basis(double *Jp, double *basis, int rows) {
+  double tau[3] = {};
+  for (int col = 0; col < 3; ++col) {
+    double scale = 0.0;
+    for (int row = col; row < rows; ++row)
+      scale = std::max(scale, fabs(Jp[3 * row + col]));
+    if (scale < 1e-15)
+      continue;
+    double inv_scale = 1.0 / scale;
+    double squared = 0.0;
+    for (int row = col; row < rows; ++row) {
+      double entry = Jp[3 * row + col] * inv_scale;
+      squared += entry * entry;
+    }
+    double pivot = Jp[3 * col + col] * inv_scale;
+    double diagonal = -copysign(sqrt(squared), pivot);
+    tau[col] = (diagonal - pivot) / diagonal;
+    double inv_lead = inv_scale / (pivot - diagonal);
+    for (int row = col + 1; row < rows; ++row)
+      Jp[3 * row + col] *= inv_lead;
+
+    for (int j = col + 1; j < 3; ++j) {
+      double dot = Jp[3 * col + j];
+      for (int row = col + 1; row < rows; ++row)
+        dot += Jp[3 * row + col] * Jp[3 * row + j];
+      dot *= tau[col];
+      Jp[3 * col + j] -= dot;
+      for (int row = col + 1; row < rows; ++row)
+        Jp[3 * row + j] -= Jp[3 * row + col] * dot;
+    }
+  }
+
+  std::fill_n(basis, (size_t)rows * 3, 0.0);
+  for (int col = 2; col >= 0; --col) {
+    basis[3 * col + col] = 1.0 - tau[col];
+    for (int row = col + 1; row < rows; ++row)
+      basis[3 * row + col] = -Jp[3 * row + col] * tau[col];
+    for (int j = col + 1; j < 3; ++j) {
+      double dot = 0.0;
+      for (int row = col + 1; row < rows; ++row)
+        dot += Jp[3 * row + col] * basis[3 * row + j];
+      dot *= tau[col];
+      basis[3 * col + j] = -dot;
+      for (int row = col + 1; row < rows; ++row)
+        basis[3 * row + j] -= Jp[3 * row + col] * dot;
+    }
+  }
+}
+
+/* Cholesky QR avoids explicit reflectors for well-conditioned point tracks.
+ * Use Householder QR if the Gram matrix has small pivots or extreme scale. */
+static void point_column_basis(double *Jp, double *basis, int rows) {
+  double normal[9] = {};
+  for (int row = 0; row < rows; ++row) {
+    const double *p = Jp + 3 * row;
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j <= i; ++j)
+        normal[3 * i + j] += p[i] * p[j];
+  }
+  const double trace = normal[0] + normal[4] + normal[8];
+  double L[9];
+  const double min_pivot = 1e-5 * trace;
+  if (!isfinite(trace) || trace < 1e-28 || cholesky_3x3_spd(normal, L) != 0 ||
+      !(L[0] * L[0] >= min_pivot && L[4] * L[4] >= min_pivot && L[8] * L[8] >= min_pivot)) {
+    householder_point_basis(Jp, basis, rows);
+    return;
+  }
+  const double inv0 = 1.0 / L[0];
+  const double inv1 = 1.0 / L[4];
+  const double inv2 = 1.0 / L[8];
+  for (int row = 0; row < rows; ++row) {
+    const double *p = Jp + 3 * row;
+    double *q = basis + 3 * row;
+    q[0] = p[0] * inv0;
+    q[1] = (p[1] - L[3] * q[0]) * inv1;
+    q[2] = (p[2] - L[6] * q[0] - L[7] * q[1]) * inv2;
+  }
+}
+
+static inline void add_camera_row(double *__restrict output, const double *__restrict right,
+                                  double u, double v, int columns) {
+  int j = 0;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  for (; j + 1 < columns; j += 2) {
+    float64x2_t total = vld1q_f64(output + j);
+    total = vfmaq_n_f64(total, vld1q_f64(right + j), u);
+    total = vfmaq_n_f64(total, vld1q_f64(right + 9 + j), v);
+    vst1q_f64(output + j, total);
+  }
+#endif
+  for (; j < columns; ++j)
+    output[j] += u * right[j] + v * right[9 + j];
+}
+
+/* Load the right Jacobian once per camera pair and reuse it for all
+ * nine rows in the off-diagonal tile. */
+static inline void add_camera_pair(double *__restrict matrix, int stride,
+                                   const double *__restrict left,
+                                   const double *__restrict right,
+                                   const double (&gram)[2][2]) {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+  float64x2_t right0[4], right1[4];
+  for (int j = 0; j < 4; ++j) {
+    right0[j] = vld1q_f64(right + 2 * j);
+    right1[j] = vld1q_f64(right + 9 + 2 * j);
+  }
+#endif
+  for (int i = 0; i < 9; ++i) {
+    const double u = left[i] * gram[0][0] + left[9 + i] * gram[1][0];
+    const double v = left[i] * gram[0][1] + left[9 + i] * gram[1][1];
+    double *row = matrix + i * stride;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    for (int j = 0; j < 4; ++j) {
+      float64x2_t total = vld1q_f64(row + 2 * j);
+      total = vfmaq_n_f64(total, right0[j], u);
+      total = vfmaq_n_f64(total, right1[j], v);
+      vst1q_f64(row + 2 * j, total);
+    }
+    row[8] += u * right[8] + v * right[17];
+#else
+    add_camera_row(row, right, u, v, 9);
+#endif
+  }
+}
+
+/* A full-rank four-row track has only one null direction. Signed
+ * three-row minors find it directly; weak tracks use the general QR path. */
+static bool two_observation_null(const double *point, double (&null_row)[4]) {
+  double scale = 0.0;
+  for (int i = 0; i < 12; ++i)
+    scale = std::max(scale, fabs(point[i]));
+  if (!(scale > 1e-15 && isfinite(scale)))
+    return false;
+  const double inv_scale = 1.0 / scale;
+  double p[4][3];
+  for (int row = 0; row < 4; ++row)
+    for (int j = 0; j < 3; ++j)
+      p[row][j] = point[3 * row + j] * inv_scale;
+  auto determinant = [](const double *a, const double *b, const double *c) {
+    return a[0] * (b[1] * c[2] - b[2] * c[1]) +
+           a[1] * (b[2] * c[0] - b[0] * c[2]) +
+           a[2] * (b[0] * c[1] - b[1] * c[0]);
+  };
+  null_row[0] = determinant(p[1], p[2], p[3]);
+  null_row[1] = -determinant(p[0], p[2], p[3]);
+  null_row[2] = determinant(p[0], p[1], p[3]);
+  null_row[3] = -determinant(p[0], p[1], p[2]);
+  double squared = 0.0;
+  for (double value : null_row)
+    squared += value * value;
+  if (!(squared > 1e-8))
+    return false;
+  const double inv_norm = 1.0 / sqrt(squared);
+  for (double &value : null_row)
+    value *= inv_norm;
+  return true;
+}
+
+static void add_two_observation_track(double *S, double *b, int stride,
+                                      const int *cams, const double *camera,
+                                      const double *residual, const double (&q)[4]) {
+  double projected[2][9];
+  double rhs = 0.0;
+  for (int k = 0; k < 4; ++k)
+    rhs += q[k] * residual[k];
+  for (int k = 0; k < 2; ++k)
+    for (int j = 0; j < 9; ++j)
+      projected[k][j] = q[2 * k] * camera[18 * k + j] + q[2 * k + 1] * camera[18 * k + 9 + j];
+
+  int blocks = 2;
+  if (cams[0] == cams[1]) {
+    for (int j = 0; j < 9; ++j)
+      projected[0][j] += projected[1][j];
+    blocks = 1;
+  }
+  for (int k = 0; k < blocks; ++k) {
+    const int offset = cams[k] * 9;
+    for (int i = 0; i < 9; ++i) {
+      const double left = projected[k][i];
+      b[offset + i] += left * rhs;
+      double *row = S + (offset + i) * stride + offset;
+      for (int j = 0; j <= i; ++j)
+        row[j] += left * projected[k][j];
+    }
+  }
+  if (blocks == 2) {
+    int left = cams[0] > cams[1] ? 0 : 1;
+    int right = 1 - left;
+    for (int i = 0; i < 9; ++i) {
+      double *row = S + (cams[left] * 9 + i) * stride + cams[right] * 9;
+      for (int j = 0; j < 9; ++j)
+        row[j] += projected[left][i] * projected[right][j];
+    }
+  }
+}
+
+static inline void rotate_point(const double *R, const double *point, double *rotated) {
+  for (int i = 0; i < 3; ++i)
+    rotated[i] = R[3 * i] * point[0] + R[3 * i + 1] * point[1] + R[3 * i + 2] * point[2];
+}
+
 static void project(const Camera *cam, const double R[9], const double Pw[3], double *u, double *v) {
   double Xc[3];
-  mat3_mul_vec(R, Pw, Xc);
+  rotate_point(R, Pw, Xc);
   Xc[0] += cam->t[0];
   Xc[1] += cam->t[1];
   Xc[2] += cam->t[2];
@@ -274,11 +437,11 @@ static void project(const Camera *cam, const double R[9], const double Pw[3], do
   *v = cam->f * distortion * yn;
 }
 
-static void jacobians(const Camera *cam, const double R[9], const double Pw[3], double J_cam[18],
-                      double J_point[6]) {
+static void linearize(const Camera *cam, const double R[9], const double Pw[3],
+                      double J_cam[18], double J_point[6], double *u, double *v) {
   double Xc[3];
   double RPw[3];
-  mat3_mul_vec(R, Pw, RPw);
+  rotate_point(R, Pw, RPw);
   Xc[0] = RPw[0];
   Xc[1] = RPw[1];
   Xc[2] = RPw[2];
@@ -291,6 +454,8 @@ static void jacobians(const Camera *cam, const double R[9], const double Pw[3], 
 
   double r2 = xn * xn + yn * yn;
   double g = 1.0 + cam->k1 * r2 + cam->k2 * r2 * r2;
+  *u = cam->f * g * xn;
+  *v = cam->f * g * yn;
   double dg_dxn = cam->k1 * 2.0 * xn + cam->k2 * 4.0 * r2 * xn;
   double dg_dyn = cam->k1 * 2.0 * yn + cam->k2 * 4.0 * r2 * yn;
 
@@ -314,32 +479,14 @@ static void jacobians(const Camera *cam, const double R[9], const double Pw[3], 
   Jpi[4] = dpy_dyn * d_yn_dY;
   Jpi[5] = dpy_dxn * d_xn_dZ + dpy_dyn * d_yn_dZ;
 
-  double S[9];
-  skew(RPw, S);
-  double A[18];
-  for (int r = 0; r < 3; ++r) {
-    for (int c = 0; c < 3; ++c) {
-      A[r * 6 + c] = -S[r * 3 + c];
-    }
-  }
-  A[0 * 6 + 3] = 1;
-  A[0 * 6 + 4] = 0;
-  A[0 * 6 + 5] = 0;
-  A[1 * 6 + 3] = 0;
-  A[1 * 6 + 4] = 1;
-  A[1 * 6 + 5] = 0;
-  A[2 * 6 + 3] = 0;
-  A[2 * 6 + 4] = 0;
-  A[2 * 6 + 5] = 1;
-
-  for (int r = 0; r < 2; ++r) {
-    for (int c = 0; c < 6; ++c) {
-      double s = 0.0;
-      for (int k = 0; k < 3; ++k) {
-        s += Jpi[r * 3 + k] * A[k * 6 + c];
-      }
-      J_cam[r * 9 + c] = s;
-    }
+  for (int row = 0; row < 2; ++row) {
+    const double *d = Jpi + row * 3;
+    double *camera = J_cam + row * 9;
+    /* A left rotation perturbation gives RPw cross the image gradient. */
+    camera[0] = RPw[1] * d[2] - RPw[2] * d[1];
+    camera[1] = RPw[2] * d[0] - RPw[0] * d[2];
+    camera[2] = RPw[0] * d[1] - RPw[1] * d[0];
+    std::copy_n(d, 3, camera + 3);
   }
 
   J_cam[0 * 9 + 6] = g * xn;
@@ -391,9 +538,92 @@ static double compute_loss(const Camera *cams, const double *R_all, const Point 
   return total;
 }
 
-// Load BAL-format dataset: cameras, points, observations.
-// Layout and parsing mirror msckf.c:load_bal exactly so the same
-// datasets and downstream processing can be reused here.
+static bool bal_space(char ch) {
+  return ch == ' ' || (ch >= '\t' && ch <= '\r');
+}
+
+static bool bal_digit(char ch) {
+  return ch >= '0' && ch <= '9';
+}
+
+static bool read_short_integer(const char *&next, int &value) {
+  const char *p = next;
+  while (bal_space(*p))
+    ++p;
+  if (!bal_digit(*p))
+    return false;
+  int result = 0;
+  int digits = 0;
+  do {
+    if (++digits > 9)
+      return false;
+    result = 10 * result + (*p++ - '0');
+  } while (bal_digit(*p));
+  if (*p && !bal_space(*p))
+    return false;
+  value = result;
+  next = p;
+  return true;
+}
+
+/* Short decimal tokens can be rounded with one operation: the mantissa
+ * and every power of ten through 10^22 are exact in binary64. */
+static bool read_short_decimal(const char *&next, double &value) {
+  const char *p = next;
+  while (bal_space(*p))
+    ++p;
+  bool negative = *p == '-';
+  if (*p == '+' || *p == '-')
+    ++p;
+
+  uint64_t mantissa = 0;
+  int digits = 0;
+  int exponent = 0;
+  bool fraction = false;
+  while (bal_digit(*p) || (*p == '.' && !fraction)) {
+    if (*p == '.') {
+      fraction = true;
+      ++p;
+      continue;
+    }
+    if (++digits > 15)
+      return false;
+    mantissa = mantissa * 10 + (*p++ - '0');
+    exponent -= fraction;
+  }
+  if (digits == 0)
+    return false;
+
+  if (*p == 'e' || *p == 'E') {
+    ++p;
+    bool negative_exp = *p == '-';
+    if (*p == '+' || *p == '-')
+      ++p;
+    if (!bal_digit(*p))
+      return false;
+    int parsed = 0;
+    do {
+      parsed = parsed * 10 + (*p++ - '0');
+      if (parsed > 37)
+        return false;
+    } while (bal_digit(*p));
+    exponent += negative_exp ? -parsed : parsed;
+  }
+  if ((*p && !bal_space(*p)) || exponent < -22 || exponent > 22)
+    return false;
+
+  static constexpr double powers[] = {
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22
+  };
+  double magnitude = exponent < 0 ? double(mantissa) / powers[-exponent]
+                                  : double(mantissa) * powers[exponent];
+  value = negative ? -magnitude : magnitude;
+  next = p;
+  return true;
+}
+
+// Load whitespace-delimited BAL data into a contiguous buffer for token parsing.
 static int load_bal(const char *path, Camera **cams_out, Point **pts_out, Observation **obs_out,
                     int *nc_out, int *np_out, int *no_out) {
   FILE *f = fopen(path, "r");
@@ -401,21 +631,51 @@ static int load_bal(const char *path, Camera **cams_out, Point **pts_out, Observ
     perror("open dataset");
     return -1;
   }
-
-  int nc = 0, np = 0, no = 0;
-  if (fscanf(f, "%d %d %d", &nc, &np, &no) != 3) {
-    fclose(f);
+  std::string input;
+  char chunk[64 * 1024];
+  size_t bytes;
+  while ((bytes = fread(chunk, 1, sizeof(chunk), f)) != 0)
+    input.append(chunk, bytes);
+  bool read_error = ferror(f) != 0;
+  fclose(f);
+  if (read_error)
     return -1;
-  }
+
+  const char *next = input.c_str();
+  auto read_int = [&next](int &value) {
+    if (read_short_integer(next, value))
+      return true;
+    char *end;
+    long number = strtol(next, &end, 10);
+    if (end == next || number < std::numeric_limits<int>::min() ||
+        number > std::numeric_limits<int>::max())
+      return false;
+    value = static_cast<int>(number);
+    next = end;
+    return true;
+  };
+  auto read_double = [&next](double &value) {
+    if (read_short_decimal(next, value))
+      return true;
+    char *end;
+    value = strtod(next, &end);
+    if (end == next)
+      return false;
+    next = end;
+    return true;
+  };
+
+  int nc, np, no;
+  if (!read_int(nc) || !read_int(np) || !read_int(no) || nc < 0 || np < 0 || no < 0)
+    return -1;
 
   Observation *obs = (Observation *)malloc(sizeof(Observation) * (size_t)no);
-  if (!obs) {
-    fclose(f);
+  if (!obs)
     return -1;
-  }
   for (int i = 0; i < no; ++i) {
-    if (fscanf(f, "%d %d %lf %lf", &obs[i].cam, &obs[i].point, &obs[i].u, &obs[i].v) != 4) {
-      fclose(f);
+    Observation &o = obs[i];
+    if (!read_int(o.cam) || !read_int(o.point) || !read_double(o.u) || !read_double(o.v) ||
+        o.cam < 0 || o.cam >= nc || o.point < 0 || o.point >= np) {
       free(obs);
       return -1;
     }
@@ -423,15 +683,14 @@ static int load_bal(const char *path, Camera **cams_out, Point **pts_out, Observ
 
   Camera *cams = (Camera *)malloc(sizeof(Camera) * (size_t)nc);
   if (!cams) {
-    fclose(f);
     free(obs);
     return -1;
   }
   for (int i = 0; i < nc; ++i) {
     Camera *c = &cams[i];
-    if (fscanf(f, "%lf %lf %lf %lf %lf %lf %lf %lf %lf", &c->aa[0], &c->aa[1], &c->aa[2], &c->t[0],
-               &c->t[1], &c->t[2], &c->f, &c->k1, &c->k2) != 9) {
-      fclose(f);
+    if (!read_double(c->aa[0]) || !read_double(c->aa[1]) || !read_double(c->aa[2]) ||
+        !read_double(c->t[0]) || !read_double(c->t[1]) || !read_double(c->t[2]) ||
+        !read_double(c->f) || !read_double(c->k1) || !read_double(c->k2)) {
       free(cams);
       free(obs);
       return -1;
@@ -440,22 +699,18 @@ static int load_bal(const char *path, Camera **cams_out, Point **pts_out, Observ
 
   Point *pts = (Point *)malloc(sizeof(Point) * (size_t)np);
   if (!pts) {
-    fclose(f);
     free(cams);
     free(obs);
     return -1;
   }
   for (int i = 0; i < np; ++i) {
-    if (fscanf(f, "%lf %lf %lf", &pts[i].p[0], &pts[i].p[1], &pts[i].p[2]) != 3) {
-      fclose(f);
+    if (!read_double(pts[i].p[0]) || !read_double(pts[i].p[1]) || !read_double(pts[i].p[2])) {
       free(pts);
       free(cams);
       free(obs);
       return -1;
     }
   }
-
-  fclose(f);
 
   *cams_out = cams;
   *pts_out = pts;
@@ -480,12 +735,6 @@ int main(int argc, char **argv) {
   }
 
   const int state_dim = 9 * nc;   /* total camera state: 9 per camera */
-  const int state_dim_per_cam = 9;
-  int valid_points = 0;
-  double jacobian_eval_time = 0.0;
-  double point_elim_time = 0.0;
-  int jacobian_eval_calls = 0;
-  int point_elim_calls = 0;
   int camera_number = nc;
   int point_number = np;
   int observation_number = no;
@@ -504,39 +753,58 @@ int main(int argc, char **argv) {
   }
 
   const double huber_delta = 0.0; // match msckf default (no robustification)
-  double residual_eval_time = 0.0;
-  int residual_eval_calls = 0;
   int max_iters = 6;
 
-  // Build point -> observation index lists (like msckf.c)
-  PointObs *point_obs = (PointObs *)calloc((size_t)np, sizeof(PointObs));
+  /* Keep the input order for loss evaluation and a contiguous track order
+   * for the two passes that repeatedly visit each point's observations. */
+  std::vector<PointObs> point_obs(np);
+  std::vector<Observation> observations_by_point(no);
+  for (int i = 0; i < no; ++i)
+    ++point_obs[obs[i].point].count;
+  int offset = 0;
+  for (PointObs &track : point_obs) {
+    if (track.count)
+      track.observations = observations_by_point.data() + offset;
+    offset += track.count;
+    track.count = 0;
+  }
   for (int i = 0; i < no; ++i) {
-    point_obs[obs[i].point].count++;
+    PointObs &track = point_obs[obs[i].point];
+    track.observations[track.count++] = obs[i];
   }
-  for (int i = 0; i < np; ++i) {
-    if (point_obs[i].count > 0) {
-      point_obs[i].indices = (int *)malloc(sizeof(int) * point_obs[i].count);
-      point_obs[i].count = 0;
-    }
-  }
-  for (int i = 0; i < no; ++i) {
-    int pid = obs[i].point;
-    int idx = point_obs[pid].count++;
-    point_obs[pid].indices[idx] = i;
-  }
+  /* Size point scratch buffers once and reuse them across tracks and iterations.
+   * A track can contain repeated observations from the same camera. */
+  int max_track_size = 0;
+  for (int i = 0; i < np; ++i)
+    max_track_size = std::max(max_track_size, point_obs[i].count);
+  const size_t max_rows = (size_t)2 * max_track_size;
+  std::vector<double> point_jacobian(max_rows * 3);
+  /* Linearizations are stored in track order for contiguous back-substitution. */
+  std::vector<double> camera_jacobian((size_t)no * 18);
+  std::vector<double> cached_point_jacobian((size_t)no * 6);
+  std::vector<double> residual((size_t)no * 2);
+  std::vector<double> point_basis(max_rows * 3);
+  std::vector<int> camera_ids(max_track_size);
+
+  double current_loss = 0.0;
+  /* Per-point profiling is optional. Whole-iteration timers remain on. */
+  const bool profile_points = getenv("SHUR_PROFILE_POINTS") != nullptr;
+  const auto point_time = [profile_points]() {
+    return profile_points ? wall_seconds() : 0.0;
+  };
+
   for (int iter = 0; iter < max_iters; ++iter) {
     double t_iter_start = wall_seconds();
 
     /* Step 1: Evaluate loss at current state */
     double t_step1 = wall_seconds();
-    double loss_prev = compute_loss(cams, R_all, pts, obs, no, huber_delta);
+    if (iter == 0)
+      current_loss = compute_loss(cams, R_all, pts, obs, no, huber_delta);
+    double loss_prev = current_loss;
     double dt_step1 = wall_seconds() - t_step1;
-    residual_eval_time += dt_step1;
-    residual_eval_calls++;
     printf("iter %d loss %.6f\n", iter, loss_prev);
 
     /* Step 2: Allocate reduced system S (state_dim x state_dim), b (state_dim); zeroed */
-    valid_points = 0;
     int *camera_index = (int *)malloc(sizeof(int) * (size_t)nc);
     double *S = (double *)calloc((size_t)state_dim * state_dim, sizeof(double));
     double *b = (double *)calloc((size_t)state_dim, sizeof(double));
@@ -548,132 +816,115 @@ int main(int argc, char **argv) {
       break;
     }
 
-    /* Step 3: Givens point elimination + Gram accumulation into S, b.
-     * Optimization: use a compact Hx of size m × (cnt*9) — only the cnt camera blocks
-     * that observe this point are stored.  After Givens the null rows are dense in these
-     * cnt*9 columns only, so the outer product in 3c costs O((cnt*9)^2) instead of
-     * O(state_dim^2), giving a (state_dim/(cnt*9))^2 ≈ 64x speedup for cnt=2. */
+    /* Step 3: Apply the point null-space projector in observation coordinates.
+     * Each observation has two rows and a single 2-by-9 camera Jacobian block. */
     double t_step3 = wall_seconds();
     double dt_3a = 0.0, dt_3b = 0.0, dt_3c = 0.0;
+    size_t track_offset = 0;
     for (int pid = 0; pid < np; ++pid) {
       int cnt = point_obs[pid].count;
       if (cnt < 2) continue;
-      valid_points++;
       int m = 2 * cnt;
-      int compact_cols = cnt * 9; /* only camera blocks that see this point */
+      double *Hf = point_jacobian.data();
+      double *Hx = camera_jacobian.data() + track_offset * 18;
+      double *cached_Hf = cached_point_jacobian.data() + track_offset * 6;
+      double *basis = point_basis.data();
+      double *r = residual.data() + track_offset * 2;
+      track_offset += cnt;
+      int *cam_list = camera_ids.data();
 
-      double *Hf = (double *)calloc((size_t)m * 3, sizeof(double));
-      /* Hx_compact: m rows × compact_cols cols; row 2j+0/2j+1 nonzero in block j*9..(j+1)*9-1 */
-      double *Hx = (double *)calloc((size_t)m * compact_cols, sizeof(double));
-      double *r  = (double *)calloc((size_t)m, sizeof(double));
-      int    *cam_list = (int *)malloc(sizeof(int) * (size_t)cnt); /* global cam index per obs */
-      if (!Hf || !Hx || !r || !cam_list) {
-        free(Hf); free(Hx); free(r); free(cam_list); break;
-      }
-
-      /* Step 3a: Build Hf, Hx_compact, r. Each obs j occupies columns j*9..(j+1)*9-1 in Hx. */
-      double t_3a = wall_seconds();
+      /* Step 3a: Linearize into point rows and separate camera blocks. */
+      double t_3a = point_time();
       for (int j = 0; j < cnt; ++j) {
-        const Observation *o = &obs[point_obs[pid].indices[j]];
+        const Observation *o = &point_obs[pid].observations[j];
         const Camera *c = &cams[o->cam];
         const double *R = &R_all[o->cam * 9];
         cam_list[j] = o->cam;
         double up, vp;
-        project(c, R, pts[o->point].p, &up, &vp);
+        double Jc[18], Jf[6];
+        linearize(c, R, pts[pid].p, Jc, Jf, &up, &vp);
         double du = up - o->u;
         double dv = vp - o->v;
-        double w = huber_weight(du * du + dv * dv, huber_delta);
-        double sw = sqrt(w);
-        double Jc[18], Jf[6];
-        jacobians(c, R, pts[o->point].p, Jc, Jf);
-        for (int col = 0; col < 3; ++col) {
-          Hf[(2 * j + 0) * 3 + col] = sw * Jf[0 * 3 + col];
-          Hf[(2 * j + 1) * 3 + col] = sw * Jf[1 * 3 + col];
+        double sw = sqrt(huber_weight(du * du + dv * dv, huber_delta));
+        for (int col = 0; col < 6; ++col) {
+          double value = sw * Jf[col];
+          Hf[j * 6 + col] = value;
+          cached_Hf[j * 6 + col] = value;
         }
-        int off = j * 9; /* compact offset */
-        for (int col = 0; col < 9; ++col) {
-          Hx[(2 * j + 0) * compact_cols + (off + col)] = sw * Jc[0 * 9 + col];
-          Hx[(2 * j + 1) * compact_cols + (off + col)] = sw * Jc[1 * 9 + col];
-        }
-        r[2 * j + 0] = -sw * du;
+        for (int col = 0; col < 18; ++col)
+          Hx[j * 18 + col] = sw * Jc[col];
+        r[2 * j] = -sw * du;
         r[2 * j + 1] = -sw * dv;
       }
-      dt_3a += wall_seconds() - t_3a;
-      jacobian_eval_time += wall_seconds() - t_3a;
-      jacobian_eval_calls++;
+      /* Step 3b: Build the three orthonormal point directions. */
+      double t_3b = point_time();
+      dt_3a += t_3b - t_3a;
+      double null_row[4];
+      const bool short_track = cnt == 2 && two_observation_null(Hf, null_row);
+      if (!short_track)
+        point_column_basis(Hf, basis, m);
 
-      /* Step 3b: Givens QR on Hf (m×3) and Hx_compact (m×compact_cols) and r (m).
-       * compact_cols << state_dim so each apply_givens_rows call is much cheaper. */
-      double t_3b = wall_seconds();
-      for (int col = 0; col < 3; ++col) {
-        for (int row = m - 1; row > col; --row) {
-          double a = Hf[col * 3 + col];
-          double bv = Hf[row * 3 + col];
-          double c_g, s_g;
-          givens(a, bv, &c_g, &s_g);
-          apply_givens_rows(Hf, m, 3, col, row, c_g, s_g);
-          apply_givens_rows(Hx, m, compact_cols, col, row, c_g, s_g);
-          apply_givens_vec(r, col, row, c_g, s_g);
-        }
+      /* Step 3c: Form blocks of the observation-space projector I - U U^T,
+       * where U contains the three point directions. Its entries are bounded
+       * before multiplication by the camera Jacobians. */
+      double t_3c = point_time();
+      dt_3b += t_3c - t_3b;
+      if (short_track) {
+        add_two_observation_track(S, b, state_dim, cam_list, Hx, r, null_row);
+        dt_3c += point_time() - t_3c;
+        continue;
       }
-      dt_3b += wall_seconds() - t_3b;
-      point_elim_time += wall_seconds() - t_3b;
-      point_elim_calls++;
+      double point_rhs[3] = {};
+      for (int row = 0; row < m; ++row)
+        for (int j = 0; j < 3; ++j)
+          point_rhs[j] += basis[3 * row + j] * r[row];
 
-      /* Precompute global column index for each compact column (avoids div/mod in inner loop). */
-      int *g_map = (int *)malloc(sizeof(int) * (size_t)compact_cols);
-      if (!g_map) { free(Hf); free(Hx); free(r); free(cam_list); break; }
-      for (int k = 0; k < cnt; ++k) {
-        int base = cam_list[k] * 9;
-        for (int i = 0; i < 9; ++i) g_map[k * 9 + i] = base + i;
-      }
-
-      /* Step 3c: S += Hx_null^T Hx_null, b += Hx_null^T r_null.
-       * Restructured by camera-block pairs to write contiguous 9×9 tiles of S —
-       * this is cache-friendly and auto-vectorizable (the rr loop is the innermost). */
-      double t_3c = wall_seconds();
-      int keep_rows = m - 3;
-      const double *null_base = &Hx[3 * compact_cols]; /* first null row */
-
-      /* b update: for each null row, scatter into global b */
-      for (int rr = 0; rr < keep_rows; ++rr) {
-        const double *hrow = null_base + rr * compact_cols;
-        double rv = r[3 + rr];
-        for (int ci = 0; ci < compact_cols; ++ci)
-          b[g_map[ci]] += hrow[ci] * rv;
-      }
-
-      /* S update: iterate over upper-triangle block pairs (k1 ≤ k2).
-       * For each pair write a contiguous 9×9 tile of S. */
       for (int k1 = 0; k1 < cnt; ++k1) {
-        int g1 = cam_list[k1] * 9;
+        const double *camera = Hx + k1 * 18;
+        double rhs[2] = {r[2 * k1], r[2 * k1 + 1]};
+        for (int i = 0; i < 2; ++i)
+          for (int j = 0; j < 3; ++j)
+            rhs[i] -= basis[6 * k1 + 3 * i + j] * point_rhs[j];
+
+        double *camera_rhs = b + cam_list[k1] * 9;
+        for (int j = 0; j < 9; ++j)
+          camera_rhs[j] += camera[j] * rhs[0] + camera[9 + j] * rhs[1];
+
         for (int k2 = k1; k2 < cnt; ++k2) {
-          int g2 = cam_list[k2] * 9;
-          /* Accumulate 9×9 outer product tile over all null rows. */
-          for (int i = 0; i < 9; ++i) {
-            double col_i[16]; /* null-row values at compact col k1*9+i, up to 13 null rows */
-            for (int rr = 0; rr < keep_rows; ++rr)
-              col_i[rr] = null_base[rr * compact_cols + k1 * 9 + i];
-            int jstart = (k2 == k1) ? i : 0;
-            for (int j = jstart; j < 9; ++j) {
-              double s = 0.0;
-              for (int rr = 0; rr < keep_rows; ++rr)
-                s += col_i[rr] * null_base[rr * compact_cols + k2 * 9 + j];
-              int gi = (g1 + i) * state_dim + (g2 + j);
-              S[gi] += s;
-              if (k1 != k2 || i != j)
-                S[(g2 + j) * state_dim + (g1 + i)] += s;
+          int left = k1;
+          int right = k2;
+          if (cam_list[left] < cam_list[right])
+            std::swap(left, right);
+          const int g1 = cam_list[left] * 9;
+          const int g2 = cam_list[right] * 9;
+          double gram[2][2] = {};
+          for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 2; ++j) {
+              double entry = (k1 == k2 && i == j) ? 1.0 : 0.0;
+              for (int k = 0; k < 3; ++k)
+                entry -= basis[6 * left + 3 * i + k] * basis[6 * right + 3 * j + k];
+              gram[i][j] = entry;
+            }
+          }
+
+          const double *jl = Hx + left * 18;
+          const double *jr = Hx + right * 18;
+          if (g1 != g2) {
+            add_camera_pair(S + g1 * state_dim + g2, state_dim, jl, jr, gram);
+          } else {
+            for (int i = 0; i < 9; ++i) {
+              double u = jl[i] * gram[0][0] + jl[9 + i] * gram[1][0];
+              double v = jl[i] * gram[0][1] + jl[9 + i] * gram[1][1];
+              double *matrix_row = S + (g1 + i) * state_dim + g2;
+              add_camera_row(matrix_row, jr, u, v, i + 1);
+              if (k1 != k2)
+                for (int j = i; j < 9; ++j)
+                  S[(g2 + j) * state_dim + g1 + i] += u * jr[j] + v * jr[9 + j];
             }
           }
         }
       }
-      dt_3c += wall_seconds() - t_3c;
-      free(g_map);
-
-      free(Hf);
-      free(Hx);
-      free(r);
-      free(cam_list);
+      dt_3c += point_time() - t_3c;
     }
 
     double dt_step3 = wall_seconds() - t_step3;
@@ -706,71 +957,35 @@ int main(int argc, char **argv) {
       free(b);
       break;
     }
+    track_offset = 0;
     for (int pid = 0; pid < np; ++pid) {
       int cnt = point_obs[pid].count;
       if (cnt < 2) continue;
-      double Cp[9] = {0.0};
-      double JpTr[3] = {0.0, 0.0, 0.0};
-      double *A_camera = (double *)calloc((size_t)cnt * state_dim_per_cam * 3, sizeof(double));
-      int *cam_idx = (int *)malloc(sizeof(int) * (size_t)cnt);
-
-      for (int j = 0; j < cnt; ++j) {
-        const Observation *o = &obs[point_obs[pid].indices[j]];
-        const Camera *c = &cams[o->cam];
-        const double *R = &R_all[o->cam * 9];
-        cam_idx[j] = o->cam;
-        double up, vp;
-        project(c, R, pts[o->point].p, &up, &vp);
-        double du = up - o->u;
-        double dv = vp - o->v;
-        double w = huber_weight(du * du + dv * dv, huber_delta);
-        double sw = sqrt(w);
-        double Jc[18], Jf[6];
-        jacobians(c, R, pts[o->point].p, Jc, Jf);
-        double Hc_local[18], Hp_local[6];
-        for (int col = 0; col < 3; ++col) {
-          Hp_local[0 * 3 + col] = sw * Jf[0 * 3 + col];
-          Hp_local[1 * 3 + col] = sw * Jf[1 * 3 + col];
-        }
-        for (int col = 0; col < 9; ++col) {
-          Hc_local[0 * 9 + col] = sw * Jc[0 * 9 + col];
-          Hc_local[1 * 9 + col] = sw * Jc[1 * 9 + col];
-        }
-        JpTr[0] += Hp_local[0 * 3 + 0] * (-sw * du) + Hp_local[1 * 3 + 0] * (-sw * dv);
-        JpTr[1] += Hp_local[0 * 3 + 1] * (-sw * du) + Hp_local[1 * 3 + 1] * (-sw * dv);
-        JpTr[2] += Hp_local[0 * 3 + 2] * (-sw * du) + Hp_local[1 * 3 + 2] * (-sw * dv);
-        accum_HptHp(Hp_local, 2, Cp);
-        double *A_row = &A_camera[j * (state_dim_per_cam * 3)];
-        shur_construction<2, 9, 3>(Hc_local, Hp_local, A_row);
-      }
-
-      double trace_cp = Cp[0] + Cp[4] + Cp[8];
-      const double cp_eps = 1e-10 * (1.0 + (trace_cp > 0 ? trace_cp : 0.0));
-      double Cp_reg[9];
-      for (int i = 0; i < 9; ++i) Cp_reg[i] = Cp[i];
-      Cp_reg[0] += cp_eps;
-      Cp_reg[4] += cp_eps;
-      Cp_reg[8] += cp_eps;
-      double Cp_inv[9];
-      inv_3x3(Cp_reg, Cp_inv);
-
-      double rhs_pt[3] = {JpTr[0], JpTr[1], JpTr[2]};
-      for (int j = 0; j < cnt; ++j) {
-        const double *Aj = &A_camera[j * (state_dim_per_cam * 3)];
-        const double *dx_cam_j = &b[cam_idx[j] * 9];
-        for (int k = 0; k < 3; ++k) {
-          double dot = 0.0;
-          for (int i = 0; i < 9; ++i)
-            dot += Aj[i * 3 + k] * dx_cam_j[i];
-          rhs_pt[k] -= dot;
+      double normal[9] = {};
+      double rhs[3] = {};
+      for (int j = 0; j < cnt; ++j, ++track_offset) {
+        const Observation &o = point_obs[pid].observations[j];
+        const double *camera = camera_jacobian.data() + track_offset * 18;
+        const double *point = cached_point_jacobian.data() + track_offset * 6;
+        const double *dx_camera = b + o.cam * 9;
+        for (int row = 0; row < 2; ++row) {
+          double projected_step = 0.0;
+          for (int k = 0; k < 9; ++k)
+            projected_step += camera[9 * row + k] * dx_camera[k];
+          double remaining = residual[track_offset * 2 + row] - projected_step;
+          for (int i = 0; i < 3; ++i) {
+            rhs[i] += point[3 * row + i] * remaining;
+            for (int k = 0; k <= i; ++k)
+              normal[3 * i + k] += point[3 * row + i] * point[3 * row + k];
+          }
         }
       }
-      dx_points[pid * 3 + 0] = Cp_inv[0] * rhs_pt[0] + Cp_inv[1] * rhs_pt[1] + Cp_inv[2] * rhs_pt[2];
-      dx_points[pid * 3 + 1] = Cp_inv[3] * rhs_pt[0] + Cp_inv[4] * rhs_pt[1] + Cp_inv[5] * rhs_pt[2];
-      dx_points[pid * 3 + 2] = Cp_inv[6] * rhs_pt[0] + Cp_inv[7] * rhs_pt[1] + Cp_inv[8] * rhs_pt[2];
-
-      free(A_camera);
-      free(cam_idx);
+      double trace = normal[0] + normal[4] + normal[8];
+      const double damping = 1e-10 * (1.0 + (trace > 0 ? trace : 0));
+      for (int i = 0; i < 3; ++i)
+        normal[3 * i + i] += damping;
+      solve_point_system(normal, rhs);
+      std::copy_n(rhs, 3, dx_points + 3 * pid);
     }
 
     double dt_step6 = wall_seconds() - t_step6;
@@ -817,6 +1032,7 @@ int main(int argc, char **argv) {
       }
       double loss_try = compute_loss(cams_try, R_try, pts_try, obs, no, huber_delta);
       if (loss_try < loss_prev) {
+        current_loss = loss_try;
         for (int i = 0; i < nc; ++i) {
           cams[i] = cams_try[i];
           for (int k = 0; k < 9; ++k) R_all[i * 9 + k] = R_try[i * 9 + k];
@@ -836,8 +1052,12 @@ int main(int argc, char **argv) {
 
     double dt_step7 = wall_seconds() - t_step7;
     double dt_iter  = wall_seconds() - t_iter_start;
-    printf("  iter %d timing (s): loss=%.4f  [3a jacobian=%.4f  3b givens=%.4f  3c gram=%.4f  step3=%.4f]  solve=%.4f  backsolve=%.4f  linesearch=%.4f  total=%.4f\n",
-           iter, dt_step1, dt_3a, dt_3b, dt_3c, dt_step3, dt_step5, dt_step6, dt_step7, dt_iter);
+    printf("  iter %d timing (s): loss=%.4f  ", iter, dt_step1);
+    if (profile_points)
+      printf("[3a jacobian=%.4f  3b point_qr=%.4f  3c gram=%.4f]  ",
+             dt_3a, dt_3b, dt_3c);
+    printf("step3=%.4f  solve=%.4f  backsolve=%.4f  linesearch=%.4f  total=%.4f\n",
+           dt_step3, dt_step5, dt_step6, dt_step7, dt_iter);
   }
 
   printf("shur: loaded dataset '%s'\n", path);
@@ -846,10 +1066,6 @@ int main(int argc, char **argv) {
   printf("  observations : %d\n", no);
 
   // Free point observation index lists
-  for (int i = 0; i < np; ++i) {
-    free(point_obs[i].indices);
-  }
-  free(point_obs);
 
   free(R_all);
   free(cams);
