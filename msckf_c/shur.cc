@@ -12,26 +12,13 @@
 //   S = B - A * Cp^{-1} * A^T,
 //   b_reduced = b_cam - A * Cp^{-1} * b_pt.
 //
-// DETAILED STEPS (per iteration)
-// -------------------------------
-// 1. Evaluate the reprojection loss at the current state.
-// 2. Zero the reduced camera system S and b.
-// 3. For each point seen in at least two observations, find an orthonormal
-//    basis U for the three point directions. In observation coordinates,
-//    P = I - U U^T projects out the point update. Assemble the camera terms
-//    J_cam^T P J_cam and J_cam^T P (-r) in 2-by-2 observation blocks.
-// 4. Regularize S with the same per-state damping as MSCKF.
-// 5. Solve S * dx_cam = b in place by Cholesky.
-// 6. Reuse the linearization to solve the damped 3-by-3 point systems with
-//    residual -r - J_cam * dx_cam.
-// 7. Backtracking line search (same as MSCKF): apply alpha*dx with R_new = exp(alpha*dtheta)*R; accept first alpha that reduces loss.
-// 8. Repeat from step 1 for max_iters.
+// Adaptive Levenberg-Marquardt experiment. Point elimination and recovery use
+// the same C + mu*diag(C); camera regularization is mu*diag(B). The gain ratio
+// compares actual objective reduction with the undamped linearized residual
+// model. Accepted steps shrink damping; rejected trials enlarge it. No two-view
+// rank-one shortcut is used. LAPACK solves the equilibrated camera system.
 
 #include "linalg.h"
-
-#if defined(__aarch64__) && defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -153,14 +140,40 @@ static void lt_times_vec(const double *L, const double *x, double *z, int n) {
   }
 }
 
+#ifdef SHUR_USE_LAPACK
+extern "C" {
+void dpotrf_(const char *, const int *, double *, const int *, int *);
+void dpotrs_(const char *, const int *, const int *, const double *, const int *,
+             double *, const int *, int *);
+}
+#endif
+
 // In-place Cholesky L (lower) in S, then solve L y = b, L^T x = y; x overwrites b.
 // Reads only the lower triangle of the row-major SPD matrix S. Returns 0 on success.
 static int cholesky_solve(double *S, double *b, int n) {
+#ifdef SHUR_USE_LAPACK
+  // Row-major lower storage is column-major upper storage of the same symmetric
+  // matrix. LAPACK must read U; the unused row-major upper triangle is not valid.
+  const char triangle = 'U';
+  const int nrhs = 1;
+  int info = 0;
+  dpotrf_(&triangle, &n, S, &n, &info);
+  if (info != 0) {
+    fprintf(stderr, "shur: LAPACK dpotrf info=%d\n", info);
+    return -1;
+  }
+  dpotrs_(&triangle, &n, &nrhs, S, &n, b, &n, &info);
+  if (info != 0) {
+    fprintf(stderr, "shur: LAPACK dpotrs info=%d\n", info);
+    return -1;
+  }
+  return 0;
+#else
   for (int j = 0; j < n; ++j) {
     double d = S[j * n + j];
     for (int k = 0; k < j; ++k)
       d -= S[j * n + k] * S[j * n + k];
-    if (d <= 0.0) {
+    if (!(d > 0.0) || !isfinite(d)) {
       fprintf(stderr, "[shur] LINE %d cholesky_solve: pivot d=%.6g <= 0 at j=%d (n=%d)\n", __LINE__, d, j, n);
       return -1;
     }
@@ -187,6 +200,47 @@ static int cholesky_solve(double *S, double *b, int n) {
     b[i] = v / S[i * n + i];
   }
   return 0;
+#endif
+}
+
+/* Equilibrate camera coordinates before factorization. Preserve the original
+ * system because Cholesky overwrites it even when a pivot fails. A diagonal
+ * shift in scaled coordinates is relative damping in original coordinates. */
+static int scaled_camera_solve(double *S, double *b, int n) {
+  std::vector<double> scale(n), rhs(b, b + n);
+  std::vector<double> original((size_t)n * n);
+  for (int i = 0; i < n; ++i) {
+    const double diag = S[(size_t)i * n + i];
+    if (!isfinite(diag)) return -1;
+    scale[i] = 1.0 / sqrt(std::max(fabs(diag), 1e-30));
+  }
+  for (int i = 0; i < n; ++i) {
+    rhs[i] *= scale[i];
+    for (int j = 0; j <= i; ++j) {
+      double value = (S[(size_t)i * n + j] * scale[i]) * scale[j];
+      if (!isfinite(value)) return -1;
+      original[(size_t)i * n + j] = value;
+    }
+  }
+  double damping = 0.0;
+  for (int attempt = 0; attempt < 14; ++attempt) {
+    std::copy(original.begin(), original.end(), S);
+    std::copy(rhs.begin(), rhs.end(), b);
+    for (int i = 0; i < n; ++i) S[(size_t)i * n + i] += damping;
+    if (cholesky_solve(S, b, n) == 0) {
+      bool finite = true;
+      for (int i = 0; i < n; ++i) {
+        b[i] *= scale[i];
+        finite = finite && isfinite(b[i]);
+      }
+      if (finite) {
+        printf("  camera solve relative damping=%.9g attempts=%d\n", damping, attempt + 1);
+        return 0;
+      }
+    }
+    damping = damping == 0.0 ? 1e-10 : damping * 10.0;
+  }
+  return -1;
 }
 
 typedef struct {
@@ -269,9 +323,10 @@ static void householder_point_basis(double *Jp, double *basis, int rows) {
   }
 }
 
-/* Cholesky QR avoids explicit reflectors for well-conditioned point tracks.
- * Use Householder QR if the Gram matrix has small pivots or extreme scale. */
-static void point_column_basis(double *Jp, double *basis, int rows) {
+/* Damped point elimination: use exactly the same point normal matrix as
+ * back-substitution. These columns are not an orthonormal basis: I-U U^T
+ * is the damped Schur weight, not an idempotent projector. */
+static void point_column_basis(double *Jp, double *basis, int rows, double point_mu) {
   double normal[9] = {};
   for (int row = 0; row < rows; ++row) {
     const double *p = Jp + 3 * row;
@@ -280,12 +335,12 @@ static void point_column_basis(double *Jp, double *basis, int rows) {
         normal[3 * i + j] += p[i] * p[j];
   }
   const double trace = normal[0] + normal[4] + normal[8];
+  for (int i = 0; i < 3; ++i)
+    normal[3 * i + i] += point_mu * std::max(normal[3 * i + i], 1e-12);
   double L[9];
-  const double min_pivot = 1e-5 * trace;
-  if (!isfinite(trace) || trace < 1e-28 || cholesky_3x3_spd(normal, L) != 0 ||
-      !(L[0] * L[0] >= min_pivot && L[4] * L[4] >= min_pivot && L[8] * L[8] >= min_pivot)) {
-    householder_point_basis(Jp, basis, rows);
-    return;
+  if (!isfinite(trace) || cholesky_3x3_spd(normal, L) != 0) {
+    fprintf(stderr, "shur: damped point factorization failed\n");
+    exit(2);
   }
   const double inv0 = 1.0 / L[0];
   const double inv1 = 1.0 / L[4];
@@ -301,118 +356,33 @@ static void point_column_basis(double *Jp, double *basis, int rows) {
 
 static inline void add_camera_row(double *__restrict output, const double *__restrict right,
                                   double u, double v, int columns) {
-  int j = 0;
-#if defined(__aarch64__) && defined(__ARM_NEON)
-  for (; j + 1 < columns; j += 2) {
-    float64x2_t total = vld1q_f64(output + j);
-    total = vfmaq_n_f64(total, vld1q_f64(right + j), u);
-    total = vfmaq_n_f64(total, vld1q_f64(right + 9 + j), v);
-    vst1q_f64(output + j, total);
-  }
-#endif
-  for (; j < columns; ++j)
+  for (int j = 0; j < columns; ++j)
     output[j] += u * right[j] + v * right[9 + j];
 }
 
-/* Load the right Jacobian once per camera pair and reuse it for all
- * nine rows in the off-diagonal tile. */
+/* Separate coefficient evaluation from the matrix writes so the compiler can
+ * vectorize both fixed-size phases without cross-row alias checks. */
 static inline void add_camera_pair(double *__restrict matrix, int stride,
                                    const double *__restrict left,
                                    const double *__restrict right,
                                    const double (&gram)[2][2]) {
-#if defined(__aarch64__) && defined(__ARM_NEON)
-  float64x2_t right0[4], right1[4];
-  for (int j = 0; j < 4; ++j) {
-    right0[j] = vld1q_f64(right + 2 * j);
-    right1[j] = vld1q_f64(right + 9 + 2 * j);
-  }
-#endif
+  double row_u[9], row_v[9];
   for (int i = 0; i < 9; ++i) {
-    const double u = left[i] * gram[0][0] + left[9 + i] * gram[1][0];
-    const double v = left[i] * gram[0][1] + left[9 + i] * gram[1][1];
+    row_u[i] = left[i] * gram[0][0] + left[9 + i] * gram[1][0];
+    row_v[i] = left[i] * gram[0][1] + left[9 + i] * gram[1][1];
+  }
+  for (int i = 0; i < 9; ++i) {
+    const double u = row_u[i], v = row_v[i];
     double *row = matrix + i * stride;
-#if defined(__aarch64__) && defined(__ARM_NEON)
-    for (int j = 0; j < 4; ++j) {
-      float64x2_t total = vld1q_f64(row + 2 * j);
-      total = vfmaq_n_f64(total, right0[j], u);
-      total = vfmaq_n_f64(total, right1[j], v);
-      vst1q_f64(row + 2 * j, total);
-    }
+    row[0] += u * right[0] + v * right[9];
+    row[1] += u * right[1] + v * right[10];
+    row[2] += u * right[2] + v * right[11];
+    row[3] += u * right[3] + v * right[12];
+    row[4] += u * right[4] + v * right[13];
+    row[5] += u * right[5] + v * right[14];
+    row[6] += u * right[6] + v * right[15];
+    row[7] += u * right[7] + v * right[16];
     row[8] += u * right[8] + v * right[17];
-#else
-    add_camera_row(row, right, u, v, 9);
-#endif
-  }
-}
-
-/* A full-rank four-row track has only one null direction. Signed
- * three-row minors find it directly; weak tracks use the general QR path. */
-static bool two_observation_null(const double *point, double (&null_row)[4]) {
-  double scale = 0.0;
-  for (int i = 0; i < 12; ++i)
-    scale = std::max(scale, fabs(point[i]));
-  if (!(scale > 1e-15 && isfinite(scale)))
-    return false;
-  const double inv_scale = 1.0 / scale;
-  double p[4][3];
-  for (int row = 0; row < 4; ++row)
-    for (int j = 0; j < 3; ++j)
-      p[row][j] = point[3 * row + j] * inv_scale;
-  auto determinant = [](const double *a, const double *b, const double *c) {
-    return a[0] * (b[1] * c[2] - b[2] * c[1]) +
-           a[1] * (b[2] * c[0] - b[0] * c[2]) +
-           a[2] * (b[0] * c[1] - b[1] * c[0]);
-  };
-  null_row[0] = determinant(p[1], p[2], p[3]);
-  null_row[1] = -determinant(p[0], p[2], p[3]);
-  null_row[2] = determinant(p[0], p[1], p[3]);
-  null_row[3] = -determinant(p[0], p[1], p[2]);
-  double squared = 0.0;
-  for (double value : null_row)
-    squared += value * value;
-  if (!(squared > 1e-8))
-    return false;
-  const double inv_norm = 1.0 / sqrt(squared);
-  for (double &value : null_row)
-    value *= inv_norm;
-  return true;
-}
-
-static void add_two_observation_track(double *S, double *b, int stride,
-                                      const int *cams, const double *camera,
-                                      const double *residual, const double (&q)[4]) {
-  double projected[2][9];
-  double rhs = 0.0;
-  for (int k = 0; k < 4; ++k)
-    rhs += q[k] * residual[k];
-  for (int k = 0; k < 2; ++k)
-    for (int j = 0; j < 9; ++j)
-      projected[k][j] = q[2 * k] * camera[18 * k + j] + q[2 * k + 1] * camera[18 * k + 9 + j];
-
-  int blocks = 2;
-  if (cams[0] == cams[1]) {
-    for (int j = 0; j < 9; ++j)
-      projected[0][j] += projected[1][j];
-    blocks = 1;
-  }
-  for (int k = 0; k < blocks; ++k) {
-    const int offset = cams[k] * 9;
-    for (int i = 0; i < 9; ++i) {
-      const double left = projected[k][i];
-      b[offset + i] += left * rhs;
-      double *row = S + (offset + i) * stride + offset;
-      for (int j = 0; j <= i; ++j)
-        row[j] += left * projected[k][j];
-    }
-  }
-  if (blocks == 2) {
-    int left = cams[0] > cams[1] ? 0 : 1;
-    int right = 1 - left;
-    for (int i = 0; i < 9; ++i) {
-      double *row = S + (cams[left] * 9 + i) * stride + cams[right] * 9;
-      for (int j = 0; j < 9; ++j)
-        row[j] += projected[left][i] * projected[right][j];
-    }
   }
 }
 
@@ -754,6 +724,15 @@ int main(int argc, char **argv) {
 
   const double huber_delta = 0.0; // match msckf default (no robustification)
   int max_iters = 6;
+  if (const char *value = getenv("SHUR_MAX_ITERS")) {
+    char *end = nullptr;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end || parsed < 1 || parsed > 1000) {
+      fprintf(stderr, "SHUR_MAX_ITERS must be an integer in [1,1000]\n");
+      return 1;
+    }
+    max_iters = (int)parsed;
+  }
 
   /* Keep the input order for loss evaluation and a contiguous track order
    * for the two passes that repeatedly visit each point's observations. */
@@ -786,7 +765,18 @@ int main(int argc, char **argv) {
   std::vector<double> point_basis(max_rows * 3);
   std::vector<int> camera_ids(max_track_size);
 
+  double target_cost = 0.0;
+  if (const char *value = getenv("SHUR_TARGET_COST")) {
+    char *end = nullptr;
+    target_cost = strtod(value, &end);
+    if (end == value || *end || !isfinite(target_cost) || target_cost <= 0.0) {
+      fprintf(stderr, "SHUR_TARGET_COST must be a finite positive number\n");
+      return 1;
+    }
+  }
+  double lm_mu = 1e-4, lm_nu = 2.0;
   double current_loss = 0.0;
+  bool solver_failed = false;
   /* Per-point profiling is optional. Whole-iteration timers remain on. */
   const bool profile_points = getenv("SHUR_PROFILE_POINTS") != nullptr;
   const auto point_time = [profile_points]() {
@@ -816,8 +806,9 @@ int main(int argc, char **argv) {
       break;
     }
 
-    /* Step 3: Apply the point null-space projector in observation coordinates.
+    /* Step 3: Assemble damped point elimination in observation coordinates.
      * Each observation has two rows and a single 2-by-9 camera Jacobian block. */
+    std::vector<double> camera_diagonal(state_dim, 0.0);
     double t_step3 = wall_seconds();
     double dt_3a = 0.0, dt_3b = 0.0, dt_3c = 0.0;
     size_t track_offset = 0;
@@ -851,29 +842,23 @@ int main(int argc, char **argv) {
           Hf[j * 6 + col] = value;
           cached_Hf[j * 6 + col] = value;
         }
-        for (int col = 0; col < 18; ++col)
-          Hx[j * 18 + col] = sw * Jc[col];
+        for (int col = 0; col < 18; ++col) {
+          const double value = sw * Jc[col];
+          Hx[j * 18 + col] = value;
+          camera_diagonal[o->cam * 9 + col % 9] += value * value;
+        }
         r[2 * j] = -sw * du;
         r[2 * j + 1] = -sw * dv;
       }
-      /* Step 3b: Build the three orthonormal point directions. */
+      /* Step 3b: Factor the damped point block for Schur elimination. */
       double t_3b = point_time();
       dt_3a += t_3b - t_3a;
-      double null_row[4];
-      const bool short_track = cnt == 2 && two_observation_null(Hf, null_row);
-      if (!short_track)
-        point_column_basis(Hf, basis, m);
+      point_column_basis(Hf, basis, m, lm_mu);
 
-      /* Step 3c: Form blocks of the observation-space projector I - U U^T,
-       * where U contains the three point directions. Its entries are bounded
-       * before multiplication by the camera Jacobians. */
+      /* Step 3c: Form blocks of I - U U^T, U = Jp * chol(C + mu Dp)^(-T).
+       * This is a damped Schur weight, not an idempotent projector. */
       double t_3c = point_time();
       dt_3b += t_3c - t_3b;
-      if (short_track) {
-        add_two_observation_track(S, b, state_dim, cam_list, Hx, r, null_row);
-        dt_3c += point_time() - t_3c;
-        continue;
-      }
       double point_rhs[3] = {};
       for (int row = 0; row < m; ++row)
         for (int j = 0; j < 3; ++j)
@@ -929,24 +914,23 @@ int main(int argc, char **argv) {
 
     double dt_step3 = wall_seconds() - t_step3;
 
-    /* Step 4: Regularize S — same per-state damping as MSCKF (anchor + reg lambda). */
-    const double anchor_lambda = 1e-3;
-    const double reg_lambda = 1e-6;
+    /* Step 4: Add camera damping mu * diag(B) before the camera solve. */
     for (int i = 0; i < state_dim; ++i)
-      S[i * state_dim + i] += (i < 6) ? anchor_lambda : reg_lambda;
+      S[(size_t)i * state_dim + i] += lm_mu * std::max(camera_diagonal[i], 1e-12);
 
     /* Step 5: Solve S*dx_cam = b via Cholesky. */
     double t_step5 = wall_seconds();
-    int solve_ok = cholesky_solve(S, b, state_dim);
+    int solve_ok = scaled_camera_solve(S, b, state_dim);
     double dt_step5 = wall_seconds() - t_step5;
     if (solve_ok != 0) {
+      solver_failed = true;
       fprintf(stderr, "shur: Cholesky solve failed at iter %d\n", iter);
       free(camera_index);
       free(S);
       free(b);
       break;
     }
-    /* b now holds dx_cam (same delta as MSCKF bred) */
+    /* b now holds the camera increment. */
 
     /* Step 6: Compute dx_point per point (back-substitution). */
     double t_step6 = wall_seconds();
@@ -980,17 +964,33 @@ int main(int argc, char **argv) {
           }
         }
       }
-      double trace = normal[0] + normal[4] + normal[8];
-      const double damping = 1e-10 * (1.0 + (trace > 0 ? trace : 0));
       for (int i = 0; i < 3; ++i)
-        normal[3 * i + i] += damping;
+        normal[3 * i + i] += lm_mu * std::max(normal[3 * i + i], 1e-12);
       solve_point_system(normal, rhs);
       std::copy_n(rhs, 3, dx_points + 3 * pid);
     }
 
+    // Reduction in the unregularized linearized residual model.
+    double predicted_reduction = 0.0;
+    track_offset = 0;
+    for (int pid = 0; pid < np; ++pid) {
+      if (point_obs[pid].count < 2) continue;
+      for (int j = 0; j < point_obs[pid].count; ++j, ++track_offset) {
+        int cam = point_obs[pid].observations[j].cam;
+        for (int row = 0; row < 2; ++row) {
+          double jd = 0.0;
+          for (int k = 0; k < 9; ++k)
+            jd += camera_jacobian[track_offset * 18 + row * 9 + k] * b[cam * 9 + k];
+          for (int k = 0; k < 3; ++k)
+            jd += cached_point_jacobian[track_offset * 6 + row * 3 + k] * dx_points[pid * 3 + k];
+          predicted_reduction += residual[track_offset * 2 + row] * jd - 0.5 * jd * jd;
+        }
+      }
+    }
+
     double dt_step6 = wall_seconds() - t_step6;
 
-    /* Step 7: Backtracking line search. */
+    /* Step 7: Evaluate one LM trial and its actual/predicted reduction. */
     double t_step7 = wall_seconds();
     Camera *cams_try = (Camera *)malloc(sizeof(Camera) * (size_t)nc);
     Point *pts_try = (Point *)malloc(sizeof(Point) * (size_t)np);
@@ -1004,9 +1004,10 @@ int main(int argc, char **argv) {
       break;
     }
     double alpha = 1.0;
-    const int max_backtracks = 12;
+    const int max_backtracks = 1;
+    double gain_ratio = -1.0;
     int accepted = 0;
-    for (int bt = 0; bt < max_backtracks && alpha > 1e-4; ++bt, alpha *= 0.5) {
+    for (int bt = 0; bt < max_backtracks; ++bt) {
       for (int i = 0; i < nc; ++i) {
         cams_try[i] = cams[i];
         double dtheta[3] = {alpha * b[i * 9 + 0], alpha * b[i * 9 + 1], alpha * b[i * 9 + 2]};
@@ -1031,7 +1032,8 @@ int main(int argc, char **argv) {
         pts_try[pid].p[2] += alpha * dx_points[pid * 3 + 2];
       }
       double loss_try = compute_loss(cams_try, R_try, pts_try, obs, no, huber_delta);
-      if (loss_try < loss_prev) {
+      gain_ratio = predicted_reduction > 0.0 ? (loss_prev - loss_try) / predicted_reduction : -1.0;
+      if (isfinite(loss_try) && loss_try < loss_prev && gain_ratio > 1e-4) {
         current_loss = loss_try;
         for (int i = 0; i < nc; ++i) {
           cams[i] = cams_try[i];
@@ -1042,6 +1044,16 @@ int main(int argc, char **argv) {
         break;
       }
     }
+    printf("  lm mu=%.9g predicted=%.17g rho=%.9g\n", lm_mu, predicted_reduction, gain_ratio);
+    if (accepted) {
+      lm_mu *= std::max(1.0 / 3.0, 1.0 - pow(2.0 * gain_ratio - 1.0, 3.0));
+      lm_nu = 2.0;
+    } else {
+      lm_mu *= lm_nu;
+      lm_nu = std::min(1e12, 2.0 * lm_nu);
+    }
+    lm_mu = std::max(1e-16, std::min(1e16, lm_mu));
+    printf("  step accepted=%d alpha=%.9g cost=%.17g\n", accepted, alpha, current_loss);
     free(cams_try);
     free(pts_try);
     free(R_try);
@@ -1058,8 +1070,26 @@ int main(int argc, char **argv) {
              dt_3a, dt_3b, dt_3c);
     printf("step3=%.4f  solve=%.4f  backsolve=%.4f  linesearch=%.4f  total=%.4f\n",
            dt_step3, dt_step5, dt_step6, dt_step7, dt_iter);
+    if (target_cost > 0.0 && current_loss <= target_cost) {
+      printf("TARGET_REACHED attempts=%d cost=%.17g target=%.17g\n", iter + 1, current_loss, target_cost);
+      break;
+    }
   }
 
+  if (const char *output = getenv("SHUR_WRITE_BAL")) {
+    FILE *f = fopen(output, "w");
+    if (!f) return 4;
+    fprintf(f, "%d %d %d\n", nc, np, no);
+    for (int i = 0; i < no; ++i) fprintf(f, "%d %d %.17g %.17g\n", obs[i].cam, obs[i].point, obs[i].u, obs[i].v);
+    for (int i = 0; i < nc; ++i) {
+      for (int j = 0; j < 3; ++j) fprintf(f, "%.17g\n", cams[i].aa[j]);
+      for (int j = 0; j < 3; ++j) fprintf(f, "%.17g\n", cams[i].t[j]);
+      fprintf(f, "%.17g\n%.17g\n%.17g\n", cams[i].f, cams[i].k1, cams[i].k2);
+    }
+    for (int i = 0; i < np; ++i) for (int j = 0; j < 3; ++j) fprintf(f, "%.17g\n", pts[i].p[j]);
+    if (fclose(f) != 0) return 4;
+  }
+  printf("CHECK_FINAL_LOSS %.17g\n", compute_loss(cams, R_all, pts, obs, no, huber_delta));
   printf("shur: loaded dataset '%s'\n", path);
   printf("  cameras      : %d\n", nc);
   printf("  points       : %d\n", np);
@@ -1072,5 +1102,5 @@ int main(int argc, char **argv) {
   free(pts);
   free(obs);
 
-  return 0;
+  return solver_failed || (target_cost > 0.0 && current_loss > target_cost) ? 2 : 0;
 }
